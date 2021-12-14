@@ -19,7 +19,6 @@ namespace WellnessToSurveyCallMigration
 
             using var connection =
                 new SqlConnection(
-                    
                     "server=.\\SQLExpress;database=VoiceFriend;Trusted_Connection=True;"
                 );
             connection.Open();
@@ -31,6 +30,7 @@ namespace WellnessToSurveyCallMigration
                     ConfigurationData =
                         JsonConvert.DeserializeObject<FollowUpSurveyConfigurationData>(x.ConfigurationData)
                 }).ToList();
+            Directory.CreateDirectory("results");
             foreach (var config in configurations)
             {
 
@@ -40,18 +40,29 @@ namespace WellnessToSurveyCallMigration
                 {
                     try
                     {
-                        File.WriteAllText($"{accountId}.bak.json", JsonConvert.SerializeObject(configData));
-
                         configData.DefaultSurveyQuestionListIds ??= new Dictionary<SurveyCallType, int>();
                         var wellnessCheckToQuestionIdMapping = new Dictionary<string, int>();
+
+                        var wellnessCheckIds = GetWellnessCheckIdsFromSurveyCalls(connection, accountId);
+                        
+                        File.WriteAllText($"results/{accountId}.bak.json", JsonConvert.SerializeObject(configData, Formatting.Indented));
+                        File.WriteAllText($"results/{accountId}.bak.wellnesschecks.json", JsonConvert.SerializeObject(wellnessCheckIds, Formatting.Indented));
+
+                        foreach (var wellnessCheckId in wellnessCheckIds)
+                        {
+                            var wellnessCheck = WellnessCheckModel(connection, wellnessCheckId);
+                            var questionListId = CreateQuestionSurveyListAndUpdateSurveyCall(connection, wellnessCheck, accountId,
+                                        wellnessCheckToQuestionIdMapping);
+                        }
+
+
                         foreach (var (surveyCallType, wellnessCheckId) in configData.DefaultSurveyQuestions)
                         {
                             var wellnessCheck = WellnessCheckModel(connection, wellnessCheckId);
                             if (wellnessCheck != null)
                             {
-                                var questionListId = CreateQuestionSurveyList(connection, wellnessCheck, accountId,
+                                var questionListId = CreateQuestionSurveyListAndUpdateSurveyCall(connection, wellnessCheck, accountId,
                                     wellnessCheckToQuestionIdMapping);
-                                UpdateSurveyCall(connection, questionListId, accountId, wellnessCheck.Id);
                                 configData.DefaultSurveyQuestionListIds[surveyCallType] = questionListId;
                             }
                             else
@@ -70,11 +81,10 @@ namespace WellnessToSurveyCallMigration
                                 if (wellnessCheck != null)
                                 {
                                     // create surveyquestionlist
-                                    var questionListId = CreateQuestionSurveyList(connection, wellnessCheck, accountId,
+                                    var questionListId = CreateQuestionSurveyListAndUpdateSurveyCall(connection, wellnessCheck, accountId,
                                         wellnessCheckToQuestionIdMapping);
                                     // set surveyquestionList field above
                                     surveyCallTemplate.SurveyQuestionListId = questionListId;
-                                    UpdateSurveyCall(connection, questionListId, accountId, wellnessCheck.Id);
                                 }
                                 else
                                 {
@@ -91,9 +101,9 @@ namespace WellnessToSurveyCallMigration
 
                         UpdateFollowUpSurveyConfig(connection, accountId, config.InboundNumber,
                             JsonConvert.SerializeObject(configData));
-                        File.WriteAllText($"{accountId}.mapping.json",
+                        File.WriteAllText($"results/{accountId}.mapping.json",
                             JsonConvert.SerializeObject(wellnessCheckToQuestionIdMapping));
-                        File.WriteAllText($"{accountId}.json", JsonConvert.SerializeObject(configData));
+                        File.WriteAllText($"results/{accountId}.json", JsonConvert.SerializeObject(configData));
                         Console.WriteLine("completed");
                     }
                     catch (Exception e)
@@ -110,7 +120,7 @@ namespace WellnessToSurveyCallMigration
             }
         }
 
-        private static int CreateQuestionSurveyList(SqlConnection connection, WellnessCheckModel wellnessCheck,
+        private static int CreateQuestionSurveyListAndUpdateSurveyCall(SqlConnection connection, WellnessCheckModel wellnessCheck,
             int accountId, Dictionary<string, int> mapping)
         {
             if (mapping.ContainsKey(wellnessCheck.Id))
@@ -119,11 +129,16 @@ namespace WellnessToSurveyCallMigration
             }
             var questionListId = CreateSurveyQuestionList(connection, wellnessCheck.Name, "voice",
                 accountId);
+
+            mapping.Add(wellnessCheck.Id, questionListId);
+
             foreach (var content in wellnessCheck.Contents.Where(x=>MigratedTypes.Contains(x.Type)))
             {
                 CreateSurveyQuestionContent(connection, questionListId, content.Ordinal,
                     content.Message, content.Type, "voice", accountId);
             }
+
+            UpdateSurveyCall(connection, questionListId, accountId, wellnessCheck.Id);
 
             return questionListId;
         }
@@ -144,6 +159,13 @@ namespace WellnessToSurveyCallMigration
             return wellnessCheck;
         }
 
+        public static IEnumerable<string> GetWellnessCheckIdsFromSurveyCalls(SqlConnection connection, int accountId)
+        {
+            var wellnessCheck = connection.Query<string>(
+                "select distinct WellnessCheckId from surveycall where AccountId=@accountid;",
+                new { accountId });
+            return wellnessCheck;
+        }
 
         public static void UpdateSurveyCall(SqlConnection connection, int surveyQuestionListId, int accountId,
             string wellnessCheckId)
