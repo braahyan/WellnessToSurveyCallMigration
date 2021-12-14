@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Data.SqlClient;
+using System.IO;
 using System.Linq;
 using System.Security.Cryptography.X509Certificates;
 using Dapper;
@@ -10,14 +11,17 @@ namespace WellnessToSurveyCallMigration
 {
     class Program
     {
+
+
         static void Main(string[] args)
         {
             var sql = "select * from FollowUpSurveyConfiguration";
 
             using var connection =
                 new SqlConnection(
+                    
                     "server=.\\SQLExpress;database=VoiceFriend;Trusted_Connection=True;"
-                    );
+                );
             connection.Open();
             var configurations = connection.Query<FollowUpSurveyConfigurationDatabase>(sql)
                 .Select(x => new FollowUpSurveyConfiguration()
@@ -29,49 +33,115 @@ namespace WellnessToSurveyCallMigration
                 }).ToList();
             foreach (var config in configurations)
             {
-                if (config.ConfigurationData != null)
+
+                var configData = config.ConfigurationData;
+                var accountId = config.AccountId;
+                if (configData != null)
                 {
-
-                    // get wellness check data
-                    foreach (var surveyCallTemplate in config.ConfigurationData.SurveyCallData)
+                    try
                     {
-                        var wellnessCheck = connection.QuerySingleOrDefault<WellnessCheckModel>(
-                            "select Name, Id from wellnesscheck where Id = @id",
-                            new {id = surveyCallTemplate.WellnessCheckId});
-                        if (wellnessCheck != null)
-                        {
-                            wellnessCheck.Contents = connection.Query<WellnessCheckContentsModel>(
-                                "select * from wellnesscheckcontent where WellnessCheckId = @id",
-                                new {id = wellnessCheck.Id}).ToList();
+                        File.WriteAllText($"{accountId}.bak.json", JsonConvert.SerializeObject(configData));
 
-                            // create surveyquestionlist
-                            var questionListId = CreateSurveyQuestionList(connection, wellnessCheck.Name, "voice", config.AccountId);
-                            // create surveyquestioncontent
-                            foreach (var content in wellnessCheck.Contents)
-                            {
-                                CreateSurveyQuestionContent(connection, questionListId, content.Ordinal,
-                                    content.Message, content.Type, "voice", config.AccountId);
-                            }
-                            // set surveyquestionList field above
-                            surveyCallTemplate.SurveyQuestionListId = questionListId;
-                            UpdateFollowUpSurveyConfig(connection, config.AccountId, config.InboundNumber,
-                                JsonConvert.SerializeObject(config.ConfigurationData));
-                            UpdateSurveyCall(connection, questionListId, config.AccountId, wellnessCheck.Id);
-                            Console.WriteLine("completed");
-                        }
-                        else
+                        configData.DefaultSurveyQuestionListIds ??= new Dictionary<SurveyCallType, int>();
+                        var wellnessCheckToQuestionIdMapping = new Dictionary<string, int>();
+                        foreach (var (surveyCallType, wellnessCheckId) in configData.DefaultSurveyQuestions)
                         {
-                            Console.WriteLine(
-                                $"Could not find wellnesscheck id {surveyCallTemplate.WellnessCheckId} from account id {config.AccountId}");
+                            var wellnessCheck = WellnessCheckModel(connection, wellnessCheckId);
+                            if (wellnessCheck != null)
+                            {
+                                var questionListId = CreateQuestionSurveyList(connection, wellnessCheck, accountId,
+                                    wellnessCheckToQuestionIdMapping);
+                                UpdateSurveyCall(connection, questionListId, accountId, wellnessCheck.Id);
+                                configData.DefaultSurveyQuestionListIds[surveyCallType] = questionListId;
+                            }
+                            else
+                            {
+                                Console.WriteLine(
+                                    $"Could not find wellnesscheck id {wellnessCheckId} from account id {accountId}");
+                            }
                         }
+
+                        // get wellness check data
+                        foreach (var surveyCallTemplate in configData.SurveyCallData)
+                        {
+                            if (!configData.DefaultSurveyQuestions.ContainsValue(surveyCallTemplate.WellnessCheckId))
+                            {
+                                var wellnessCheck = WellnessCheckModel(connection, surveyCallTemplate.WellnessCheckId);
+                                if (wellnessCheck != null)
+                                {
+                                    // create surveyquestionlist
+                                    var questionListId = CreateQuestionSurveyList(connection, wellnessCheck, accountId,
+                                        wellnessCheckToQuestionIdMapping);
+                                    // set surveyquestionList field above
+                                    surveyCallTemplate.SurveyQuestionListId = questionListId;
+                                    UpdateSurveyCall(connection, questionListId, accountId, wellnessCheck.Id);
+                                }
+                                else
+                                {
+                                    Console.WriteLine(
+                                        $"Could not find wellnesscheck id {surveyCallTemplate.WellnessCheckId} from account id {accountId}");
+                                }
+                            }
+                            else
+                            {
+                                surveyCallTemplate.SurveyQuestionListId =
+                                    configData.DefaultSurveyQuestionListIds[surveyCallTemplate.CallType];
+                            }
+                        }
+
+                        UpdateFollowUpSurveyConfig(connection, accountId, config.InboundNumber,
+                            JsonConvert.SerializeObject(configData));
+                        File.WriteAllText($"{accountId}.mapping.json",
+                            JsonConvert.SerializeObject(wellnessCheckToQuestionIdMapping));
+                        File.WriteAllText($"{accountId}.json", JsonConvert.SerializeObject(configData));
+                        Console.WriteLine("completed");
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine($"Something went wrong with account #{accountId}: {e}");
                     }
                 }
                 else
                 {
                     Console.WriteLine(
-                        $"Could not find configuration data from account id {config.AccountId}");
+                        $"Could not find configuration data from account id {accountId}");
                 }
+
             }
+        }
+
+        private static int CreateQuestionSurveyList(SqlConnection connection, WellnessCheckModel wellnessCheck,
+            int accountId, Dictionary<string, int> mapping)
+        {
+            if (mapping.ContainsKey(wellnessCheck.Id))
+            {
+                return mapping[wellnessCheck.Id];
+            }
+            var questionListId = CreateSurveyQuestionList(connection, wellnessCheck.Name, "voice",
+                accountId);
+            foreach (var content in wellnessCheck.Contents.Where(x=>MigratedTypes.Contains(x.Type)))
+            {
+                CreateSurveyQuestionContent(connection, questionListId, content.Ordinal,
+                    content.Message, content.Type, "voice", accountId);
+            }
+
+            return questionListId;
+        }
+
+        private static WellnessCheckModel WellnessCheckModel(SqlConnection connection,
+            string wellnessCheckId)
+        {
+            var wellnessCheck = connection.QuerySingleOrDefault<WellnessCheckModel>(
+                "select Name, Id from wellnesscheck where Id = @id",
+                new {id = wellnessCheckId});
+            if (wellnessCheck != null)
+            {
+                wellnessCheck.Contents = connection.Query<WellnessCheckContentsModel>(
+                    "select * from wellnesscheckcontent where WellnessCheckId = @id",
+                    new {id = wellnessCheck.Id}).ToList();
+            }
+
+            return wellnessCheck;
         }
 
 
@@ -90,7 +160,7 @@ namespace WellnessToSurveyCallMigration
 
         public static int CreateSurveyQuestionList(SqlConnection connection, string name, string type, int accountId)
         {
-            return connection.Execute(
+            return connection.ExecuteScalar<int>(
                 "insert into SurveyQuestionList (Name, QuestionListType, AccountId) " +
                 "OUTPUT Inserted.SurveyQuestionListId " +
                 "values (@Name, @Type, @AccountId)",
@@ -102,7 +172,8 @@ namespace WellnessToSurveyCallMigration
                 });
         }
 
-        public static int CreateSurveyQuestionContent(SqlConnection connection, int surveyQuestionListId, int ordinal, string content, string contentType, string responseType, int accountId)
+        public static int CreateSurveyQuestionContent(SqlConnection connection, int surveyQuestionListId, int ordinal,
+            string content, string contentType, string responseType, int accountId)
         {
             return connection.Execute(
                 @"INSERT INTO[dbo].[SurveyQuestionContent]
@@ -125,14 +196,37 @@ namespace WellnessToSurveyCallMigration
                 new
                 {
                     SurveyQuestionListId = surveyQuestionListId,
-                    Ordinal = ordinal, 
-                    ContentId = 0, 
+                    Ordinal = ordinal,
+                    ContentId = 0,
                     Content = content,
-                    ContentType = contentType, 
-                    ResponseType = responseType, 
+                    ContentType = ConvertContentType(contentType),
+                    ResponseType = responseType,
                     AccountId = accountId
                 });
         }
+
+        public static SurveyQuestionContentTypeEnum ConvertContentType(string contentType)
+        {
+            if (contentType == "Outbound")
+            {
+                return SurveyQuestionContentTypeEnum.Greeting;
+            }
+
+            if (contentType == "TelephoneSurvey")
+            {
+                return SurveyQuestionContentTypeEnum.Question;
+            }
+
+            if (contentType == "OutboundFarewell")
+            {
+                return SurveyQuestionContentTypeEnum.Farewell;
+            }
+
+            return Enum.Parse<SurveyQuestionContentTypeEnum>(contentType);
+        }
+
+        private static List<string> MigratedTypes = new List<string>
+            {"Outbound", "TelephoneSurvey", "OutboundFarewell"};
 
         public static void UpdateFollowUpSurveyConfig(SqlConnection connection, int accountId, string number, string data)
         {
@@ -232,6 +326,7 @@ namespace WellnessToSurveyCallMigration
         public string ForwardNumber { get; set; }
 
         public Dictionary<SurveyCallType, string> DefaultSurveyQuestions { get; set; }
+        public Dictionary<SurveyCallType, int> DefaultSurveyQuestionListIds { get; set; }
         public IEnumerable<SurveyCallTemplateModel> SurveyCallData { get; set; }
         public Dictionary<string, FacilityInfoMapping> FacilityInfoToCallerIdMapping { get; set; }
         public StatusDefinition StatusConfiguration { get; set; }
@@ -260,7 +355,10 @@ namespace WellnessToSurveyCallMigration
         None,
         NoWeekends
     }
-
+    public enum SurveyQuestionContentTypeEnum
+    {
+        Greeting, Question, Farewell
+    }
     public class StatusDefinition
     {
 
